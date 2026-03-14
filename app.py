@@ -19,7 +19,20 @@ Usage:
 """
 
 import os
+import sys
 from datetime import datetime, timedelta
+
+# Load local API key if config.py exists (local dev only — not committed to version control)
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
+_DEFAULT_API_KEY = ""
+try:
+    from config import FRED_API_KEY as _LOCAL_API_KEY
+    _DEFAULT_API_KEY = _LOCAL_API_KEY  # config.py takes priority over env var
+except ImportError:
+    _DEFAULT_API_KEY = os.environ.get("FRED_API_KEY", "")
 
 import dash
 import dash_bootstrap_components as dbc
@@ -78,7 +91,7 @@ app.layout = dbc.Container(
                                         id="api-key-input",
                                         #type="password",
                                         placeholder="Paste your key here (or set FRED_API_KEY env var)",
-                                        value=os.environ.get("FRED_API_KEY", ""),
+                                        value=_DEFAULT_API_KEY,
                                         debounce=False,
                                     ),
                                 ]
@@ -159,6 +172,14 @@ app.layout = dbc.Container(
                                         id="search-status",
                                         className="text-muted small mb-2",
                                         children="Enter a search term above to find series.",
+                                    ),
+                                    dbc.Input(
+                                        id="title-filter",
+                                        type="text",
+                                        placeholder="Filter results by title keyword…",
+                                        debounce=True,
+                                        className="mb-2",
+                                        size="sm",
                                     ),
                                     dash_table.DataTable(
                                         id="results-table",
@@ -455,21 +476,75 @@ def search_series(n_clicks, search_text, api_key):
 
 
 # ---------------------------------------------------------------------------
+# Callback: Filter results table by title keyword
+# ---------------------------------------------------------------------------
+
+@app.callback(
+    Output("results-table", "data", allow_duplicate=True),
+    Output("results-table", "tooltip_data", allow_duplicate=True),
+    Output("results-table", "selected_rows", allow_duplicate=True),
+    Input("title-filter", "value"),
+    State("search-results-store", "data"),
+    prevent_initial_call=True,
+)
+def filter_by_title(keyword, search_results):
+    if not search_results:
+        return [], [], []
+
+    keyword = (keyword or "").strip().lower()
+
+    table_data = []
+    tooltip_data = []
+    for rec in search_results:
+        title = rec.get("title", "")
+        if keyword and keyword not in title.lower():
+            continue
+        freq = rec.get("frequency_short") or rec.get("frequency") or ""
+        units = rec.get("units_short") or rec.get("units") or ""
+        seas = rec.get("seasonal_adjustment_short") or rec.get("seasonal_adjustment") or ""
+        last_updated = str(rec.get("last_updated", ""))[:10]
+        table_data.append(
+            {
+                "id": rec.get("id", ""),
+                "title": title[:90] + ("…" if len(title) > 90 else ""),
+                "frequency": freq,
+                "units": units[:35] + ("…" if len(units) > 35 else ""),
+                "seasonal_adjustment": seas,
+                "last_updated": last_updated,
+            }
+        )
+        tooltip_data.append(
+            {
+                "title": {"value": title, "type": "text"},
+                "units": {"value": rec.get("units", ""), "type": "text"},
+            }
+        )
+    return table_data, tooltip_data, []
+
+
+# ---------------------------------------------------------------------------
 # Callback: Select series from table
 # ---------------------------------------------------------------------------
 
 @app.callback(
     Output("selected-series-store", "data"),
     Input("results-table", "selected_rows"),
+    State("results-table", "data"),
     State("search-results-store", "data"),
     prevent_initial_call=True,
 )
-def store_selected_series(selected_rows, search_results):
-    if not selected_rows or not search_results:
+def store_selected_series(selected_rows, table_data, search_results):
+    if not selected_rows or not table_data or not search_results:
         return []
-    # Cap at 3 series (take the last 3 selected so the user can swap by clicking)
+    # Build a lookup from series id → full record
+    records_by_id = {rec.get("id"): rec for rec in search_results}
+    # Cap at 3, using the currently visible (possibly filtered) rows
     rows = selected_rows[-3:]
-    return [search_results[i] for i in rows if i < len(search_results)]
+    return [
+        records_by_id[table_data[i]["id"]]
+        for i in rows
+        if i < len(table_data) and table_data[i]["id"] in records_by_id
+    ]
 
 
 @app.callback(
